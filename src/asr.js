@@ -1,9 +1,14 @@
 /**
- * asr.js — 台词层。三级降级（学 dsh-video-lens 的"additive"原则）：
+ * asr.js — 台词层。降级顺序（学 dsh-video-lens 的"additive"原则）：
  *
- *   1. 视频自带字幕轨 → 直接抽（零成本、最准）
- *   2. 用户配置了 OpenAI 兼容的 /audio/transcriptions → 调它（默认 SenseVoiceSmall）
- *   3. 都没有 → 返回 null，**绝不让整个分镜失败**
+ *   1. B 站官方 CC 字幕 → 直接读（最准，见 bilibili.js；编排在 pipeline.js）
+ *   2. 视频自带字幕轨 → 直接抽（零成本、最准）
+ *   3. 本机有 SenseVoice 模型 → 本地推理，不要 key、不联网（见 asr-local.js）
+ *   4. 用户配置了 OpenAI 兼容的 /audio/transcriptions → 调它（默认 SenseVoiceSmall）
+ *   5. 都没有 → 返回 null，**绝不让整个分镜失败**
+ *
+ * 3 和 4 的先后：没显式配 HTTP 时优先本地 —— 模型就在本机、不花钱、不联网，
+ * 没有理由绕一圈把音频传到云上。一旦用户配了 baseUrl 或 key，就按他配的走。
  *
  * 注意：ASR 只解释"人说了什么"，对纯音乐无能为力，也可能对音乐段落产生幻觉歌词。
  * 所以 transcribe 会跳过明显的非语音段（由静音检测给出）。
@@ -16,6 +21,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { DEFAULT_FFMPEG } from './probe.js';
+import { localAsrAvailable, transcribeLocal } from './asr-local.js';
 
 const run = promisify(execFile);
 
@@ -92,6 +98,8 @@ export function resolveAsrConfig(env = process.env) {
     model: envModel || file.model || 'FunAudioLLM/SenseVoiceSmall',
     keyEnv,
     language: envLanguage || file.language || 'zh',
+    // 'auto'（默认）= 没配 HTTP 就用本机 SenseVoice；'local' = 强制本地；'http' = 强制走接口
+    provider: cleanEnvValue(env.DSH_ASR_PROVIDER) || file.provider || 'auto',
     fileKey: typeof file.key === 'string' && file.key ? file.key : undefined,
     source: fromEnv ? 'env' : (file.baseUrl || file.key ? 'file' : 'default'),
     // 术语校正表：错误写法 → 正确写法
@@ -159,6 +167,39 @@ export async function extractSubtitleTrack({ input, ffmpegPath = DEFAULT_FFMPEG,
  * 调 OpenAI 兼容的转写接口。
  * @returns {Promise<{segments:Array<{from:number,to:number,text:string}>, model:string, language?:string}|null>}
  */
+/**
+ * 这次到底走本地还是走 HTTP。
+ *
+ * 四条全中才是本地，少一条都会静默改变已有用户的行为（踩过：一开始只看了
+ * asr.json 有没有配，结果调用方显式传 baseUrl 也被劫持到本地，测试全红）：
+ *   ① provider 是 auto（不是被显式设成 local/http）
+ *   ② 配置层面没给 baseUrl 或 key（asr.json / env 都没动过）
+ *   ③ 调用方这次也没另传 baseUrl（没传就等于默认值）
+ *   ④ 调用方这次也没另传 key
+ */
+function shouldUseLocal({ baseUrl, apiKey, provider } = {}) {
+  const cfg = resolveAsrConfig();
+  const mode = provider ?? cfg.provider ?? 'auto';
+  if (mode === 'local') return true;
+  if (mode !== 'auto') return false;              // 显式 http
+  return cfg.source === 'default'
+    && baseUrl === ASR_DEFAULTS.baseUrl
+    && !(apiKey !== undefined && apiKey !== null && apiKey !== '')
+    && localAsrAvailable();
+}
+
+/**
+ * 缓存键里要带上"走的哪条路"。
+ *
+ * 不带的话，同一条视频今天用 HTTP 转出的 `asr-empty` 会被明天切到本地之后复用，
+ * 表现得像"本地模型坏了"——实际上根本没跑。这类缓存串味极难排查，必须从键上隔开。
+ */
+export function asrCacheTag({ baseUrl = ASR_DEFAULTS.baseUrl, apiKey, provider } = {}) {
+  if (shouldUseLocal({ baseUrl, apiKey, provider })) return 'local:sensevoice';
+  const cfg = resolveAsrConfig();
+  return `http:${baseUrl}:${cfg.model}`;
+}
+
 export async function transcribe({
   input, ffmpegPath = DEFAULT_FFMPEG, start = 0, end,
   baseUrl = ASR_DEFAULTS.baseUrl, model = ASR_DEFAULTS.model,
@@ -166,7 +207,11 @@ export async function transcribe({
   apiKey,
   language = ASR_DEFAULTS.language,
   timeoutMs = 180_000,
+  provider,
 } = {}) {
+  // 走本地还是走 HTTP，判据统一在 shouldUseLocal 里（缓存键也要用同一份判断）
+  const useLocal = shouldUseLocal({ baseUrl, apiKey, provider });
+
   // undefined = 走 env/文件；显式传 null 或 '' = 明确不要 key（测试与"关掉 ASR"都用这个）
   const key = apiKey === undefined
     ? cleanEnvValue(process.env[ASR_DEFAULTS.keyEnv]) || ASR_DEFAULTS.fileKey
@@ -175,7 +220,8 @@ export async function transcribe({
   // 通常不校验 Authorization，逼用户填一个假 key 只会让"能不能用"取决于文档写没写清。
   // 云端才必须 key（没有它必然 401）。
   const local = isLoopback(baseUrl);
-  if (!key && !local) return null;                 // 云端没配 key：跳过，不报错
+  // 本地转写不需要任何 key；只有确实要走 HTTP 且是云端时才在没 key 的情况下放弃
+  if (!useLocal && !key && !local) return null;
 
   // 抽成 16k 单声道 wav（16k 是 ASR 的通用采样率，体积也可控）
   const args = [ffmpegPath, '-hide_banner', '-v', 'error', '-nostdin'];
@@ -186,6 +232,17 @@ export async function transcribe({
     encoding: 'buffer', maxBuffer: 256 * 1024 * 1024, timeout: timeoutMs,
   });
   if (stdout.length < 1024) return null;
+
+  // 本地优先：模型在本机，不花钱也不外传音频。跑不通（模型被删、原生模块缺 DLL）
+  // 就静默落回 HTTP —— 用户不该因为一条兜底路径坏了就彻底没台词。
+  if (useLocal) {
+    try {
+      const localResult = transcribeLocal(stdout, { offset: start, language });
+      if (localResult) return localResult;
+    } catch {
+      /* 落到 HTTP */
+    }
+  }
 
   const form = new FormData();
   form.append('file', new Blob([stdout], { type: 'audio/wav' }), 'audio.wav');

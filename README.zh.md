@@ -35,6 +35,48 @@ video_storyboard({ input: "https://www.bilibili.com/video/BV1fq4y1u7nC" })
 
 配置见 **[docs/SETUP.zh.md](docs/SETUP.zh.md)**（装 yt-dlp、导出 cookies、五步验证、故障对照）。
 
+## 台词从哪来：四级降级
+
+| 顺序 | 来源 | 代价 | 说明 |
+|---|---|---|---|
+| 1 | **B 站官方 CC 字幕** | 一次 API，200–600ms | 人工/平台校对过，最准；**需要登录** |
+| 2 | 视频内嵌字幕轨 | ffmpeg 抽一轨 | 零成本 |
+| 3 | **本机 SenseVoice** | 不联网、不要 key | 只要这台机器用过 DSH 的语音输入插件就已经装好 |
+| 4 | 你配的 OpenAI 兼容接口 | 按你的价 | `~/.dsh/asr.json` 或 env |
+| 5 | 都没有 | — | 不阻塞出图，`transcript=asr-empty` |
+
+顺序是 **additive** 的：任何一级拿不到都静默往下走，绝不因为台词失败而让整张图出不来。
+第 3 和第 4 之间：**没配 HTTP 就用本地**；一旦你配了 `baseUrl` 或 key，就按你配的走，
+不会被本地悄悄顶掉。想强制指定，在 `~/.dsh/asr.json` 里写 `"provider": "local"`（或 `"http"`）。
+
+### 登录一次，1080P 和字幕一起解决
+
+B 站对未登录用户有两道卡：1080P **根本不出现在格式列表里**（下游察觉不到被降级），
+以及 CC 字幕接口返回空列表。扫一次码两边都通：
+
+```bash
+node bin/bili-login.mjs                 # 出二维码 → 手机 B站 App 扫 → 自动写 cookies
+node bin/bili-login.mjs --check         # 查现在还有没有登录态
+node bin/bili-login.mjs --from <凭证文件>  # 别的插件已经登录过？直接借来，不用再扫
+```
+
+登录后 cookies 落在 `~/.dsh/bilibili-cookies.txt`，路径同时写进 `~/.dsh/video.json` ——
+yt-dlp 下高清和读官方字幕走的是同一份凭据，不用配两处。
+
+### 本地 SenseVoice 不用另外装
+
+模型和运行时由 DSH 的**语音输入**插件带来：
+`~/.dsh/speech-to-text/sensevoice/models/`（239MB int8）+ `sherpa-onnx-node`（原生模块）。
+storyboard 探测到就直接用，探测不到就跳过，不会报错也不会让你先装点什么。
+
+实测本机：212 秒的片子，本地转写 **10.5 秒**（含模型加载），零 API key。
+SenseVoice **只吐文本不吐时间戳**，句子的起止是靠 silero VAD 的语音段位置算出来的 ——
+没有这一步，整段只能挂一个起点，台词会被贴到错误的格子上。
+
+语言默认 `zh`。英文素材在 `~/.dsh/asr.json` 里写 `"language": "en"`，
+留 `auto` 会让模型自己猜，猜错时会输出中英日混排的乱码。
+
+
 ## 想在桌宠里用？
 
 有人问能不能装到 [Coopanion](https://github.com/Pal-AI-Lab/Coopanion)（基于 Cortico 的桌宠）。**已经有人在 npm 上做了**：

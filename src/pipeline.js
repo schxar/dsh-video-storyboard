@@ -11,6 +11,7 @@ import { spawn } from 'node:child_process';
 
 import { probeVideo, DEFAULT_FFMPEG, DEFAULT_FFPROBE } from './probe.js';
 import { resolveInput } from './fetch.js';
+import { tryOfficialSubtitle } from './bilibili.js';
 import { loadTranscriptFile } from './transcript-file.js';
 import { decideCuts, scanShots, spikeCuts, suppressClose } from './scan.js';
 import { rememberSegments } from './locate.js';
@@ -21,7 +22,7 @@ import { findBursts, planCellRanges } from './density.js';
 import { describeMemory, remember } from './memory.js';
 import { analyzeAudio, describeAudio, detectOnsets } from './audio.js';
 import {
-  ASR_DEFAULTS, alignCells, applyTermMap, describeAsrTarget, explainFetchError, extractSubtitleTrack,
+  alignCells, applyTermMap, asrCacheTag, describeAsrTarget, explainFetchError, extractSubtitleTrack,
   filterSuspectSegments, resolveAsrConfig, speechCurve, transcribeLong,
 } from './asr.js';
 import { cacheKey, pruneCache, withCache } from './cache.js';
@@ -196,18 +197,34 @@ export async function runStoryboard(opts) {
         };
       }
     } else if (transcript !== 'off' && info.hasAudio) {
-      const subtitle = info.hasSubtitle
-        ? await extractSubtitleTrack({ input, ffmpegPath })
-        : null;
-      if (subtitle) {
+      // B 站官方 CC 排在 ASR 之前：它是 UP 主上传或平台生成的**成品字幕**，
+      // 断句和人名都比 ASR 准，而且省掉整段转写（10 分钟口播约 60–120 秒）。
+      // 只在 B 站链接上试；拿不到（没登录 / 该片没字幕 / 接口变了）就是 null，
+      // 静默落回原来的「内嵌字幕轨 → ASR」链路，行为与从前完全一致。
+      const official = await tryOfficialSubtitle({
+        input: inputRaw,
+        log: (message) => { if (process.env.DSH_VIDEO_DEBUG) console.error(message); },
+      });
+      const subtitle = official || !info.hasSubtitle
+        ? null
+        : await extractSubtitleTrack({ input, ffmpegPath });
+      if (official) {
+        transcriptInfo = {
+          segments: official.segments,
+          source: 'bilibili-cc',
+          model: `bilibili:${official.language || 'cc'}`,
+        };
+      } else if (subtitle) {
         transcriptInfo = { segments: subtitle, source: 'subtitle', model: 'embedded' };
       } else {
         try {
           // 切片调用：单次请求过长会让时间码整体压早（实测 299s 压早 13s）。
           // 结果按 (文件, 窗口, 后端, 切片长度) 缓存 —— 否则 textOnly 分页每翻一页都要重跑 ASR。
+          // 缓存键要带上走本地还是走 HTTP：否则今天用接口转出的 asr-empty
+          // 会被明天切到本地之后复用，看起来像"本地模型坏了"，实际根本没跑。
           const asrKey = await cacheKey({
             input, start: winStart, end: winStart + winDur,
-            threshold: `asr|${ASR_DEFAULTS.baseUrl}|${ASR_DEFAULTS.model}|${asrMaxChunk}|${transcript}|${hotwords ?? ''}`,
+            threshold: `asr|${asrCacheTag()}|${asrMaxChunk}|${transcript}|${hotwords ?? ''}`,
           });
           // 本地 ASR 可能要临时拉起（用完就停）—— 只在 asr.json 配了 manage.start 时才托管
           const asrCfg = resolveAsrConfig();
