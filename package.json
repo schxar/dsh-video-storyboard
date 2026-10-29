@@ -33,7 +33,9 @@
     "./probe": "./src/probe.js",
     "./sheet": "./src/sheet.js",
     "./pipeline": "./src/pipeline.js",
-    "./tool-spec": "./src/tool-spec.js"
+    "./tool-spec": "./src/tool-spec.js",
+    "./bilibili": "./src/bilibili.js",
+    "./asr-local": "./src/asr-local.js"
   },
   "bin": {
     "dsh-video-scan": "./bin/scan-video.mjs",
