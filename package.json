@@ -65,10 +65,18 @@
     "check": "node scripts/check-syntax.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.7",
+    "@deepseek-ai/dsh-experimental-speech-to-text-sensevoice": "*",
+    "dsh-bili-subagent": "*"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-experimental-speech-to-text-sensevoice": {
+      "optional": true
+    },
+    "dsh-bili-subagent": {
       "optional": true
     }
   },

@@ -18,10 +18,9 @@
  * 一切异常都返回 null：本地转写是**兜底**，它挂了不能连带把出图也搞挂。
  */
 
-import { createRequire } from 'node:module';
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+
+import { voiceInputRuntime } from './deps.js';
 
 /** SenseVoice 只吃 16k 单声道 —— ffmpeg 那边已经转好，这里只是常量。 */
 const SAMPLE_RATE = 16000;
@@ -42,75 +41,35 @@ export function normaliseLanguage(language) {
   return 'auto';
 }
 
-/** DSH 家目录 */
-const dshHome = (env = process.env) => env.DSH_HOME || join(homedir(), '.dsh');
-
 /**
  * 找模型。返回 null 表示这台机器上没装过语音输入插件，走不了本地这条路。
+ *
+ * 判据是**那个包在不在**，不是"某个路径下有没有文件"：模型文件名和精度档位都从
+ * 包里的 runtime/assets.json 取，上游换文件名我们不用跟着改。
  * @returns {{model:string, tokens:string, vad:string, dir:string}|null}
  */
 export function locateModel({ env = process.env } = {}) {
-  const candidates = [
-    // 语音输入插件的默认落点（dshHomePath('speech-to-text','sensevoice')）
-    join(dshHome(env), 'speech-to-text', 'sensevoice', 'models'),
-    // 允许用户自己挪位置
-    ...(env.DSH_ASR_LOCAL_MODELS ? [env.DSH_ASR_LOCAL_MODELS] : []),
-  ];
-  for (const root of candidates) {
-    // int8 优先：体积是 fp32 的四分之一，中文识别质量差异在实际素材上看不出来
-    for (const name of ['model.int8.onnx', 'model.onnx']) {
-      const model = join(root, 'sensevoice-onnx', name);
-      const tokens = join(root, 'sensevoice-onnx', 'tokens.txt');
-      const vad = join(root, 'silero', 'silero_vad.onnx');
-      if (existsSync(model) && existsSync(tokens) && existsSync(vad)) {
-        return { model, tokens, vad, dir: join(root, 'sensevoice-onnx') };
-      }
-    }
-  }
-  return null;
+  const rt = voiceInputRuntime({ env });
+  if (!rt.available) return null;
+  return {
+    model: rt.model,
+    tokens: rt.tokens,
+    vad: rt.vad,
+    dir: join(rt.models, 'sensevoice-onnx'),
+  };
 }
 
 /**
  * 找 `sherpa-onnx-node`。
  *
- * 它家在 DSH 的安装目录里，不在 storyboard 自己的依赖树里 —— 所以不能裸 import。
- * 顺序：环境变量 → DSH 各 profile 的 node_modules → DSH 安装目录。
+ * 它是语音输入包自己的依赖，所以从那个包的位置去 require —— 走 Node 正常的解析规则，
+ * 比手拼一堆 node_modules 候选路径稳，也不依赖安装目录长什么样。
  * @returns {{sherpa:object, from:string}|null}
  */
 export function locateSherpa({ env = process.env } = {}) {
-  const roots = [];
-  if (env.DSH_SHERPA_ROOT) roots.push(env.DSH_SHERPA_ROOT);
-
-  const profiles = join(dshHome(env), 'profiles');
-  for (const name of ['web', 'desktop', 'headless']) {
-    roots.push(join(profiles, name, 'node_modules'));
-  }
-  roots.push(join(dshHome(env), 'node_modules'));
-
-  // 桌面端装在别处时，靠这两个环境变量兜住
-  if (env.DSH_DESKTOP_APP) roots.push(join(env.DSH_DESKTOP_APP, 'node_modules'));
-  for (const guess of [
-    'D:/DSHV2/DSH Desktop/resources/app/node_modules',
-  ]) {
-    roots.push(guess);
-  }
-
-  for (const root of roots) {
-    const entry = join(root, 'sherpa-onnx-node');
-    if (!existsSync(entry)) continue;
-    try {
-      const require = createRequire(join(root, 'noop.js'));
-      const sherpa = require('sherpa-onnx-node');
-      // 光能 require 还不够：有些安装残缺，模型类在但原生 addon 加载失败。
-      // 这里探一个必须存在的构造函数，早失败比等到推理时才发现好。
-      if (typeof sherpa?.OfflineRecognizer === 'function' && typeof sherpa?.Vad === 'function') {
-        return { sherpa, from: entry };
-      }
-    } catch {
-      /* 这个位置的不完整，试下一个 */
-    }
-  }
-  return null;
+  const rt = voiceInputRuntime({ env });
+  if (!rt.available) return null;
+  return { sherpa: rt.sherpa, from: rt.pkgDir };
 }
 
 /* ------------------------------------------------------------ WAV → Float32 */
@@ -282,15 +241,15 @@ function decodeWithTimestamps(eng, samples, { offset = 0, language = 'auto' } = 
  * @param {{offset?:number, language?:string, env?:NodeJS.ProcessEnv, threads?:number}} opts
  */
 export function transcribeLocal(wavBuffer, { offset = 0, language = 'auto', env = process.env, threads = 2 } = {}) {
-  const paths = locateModel({ env });
-  if (!paths) return null;
-  const found = locateSherpa({ env });
-  if (!found) return null;
+  // 一次探测拿全部：模型路径、原生运行时、包目录。分两次调（locateModel + locateSherpa）
+  // 会把模块解析和文件存在性检查各跑一遍，白花时间。
+  const rt = voiceInputRuntime({ env, });
+  if (!rt.available) return null;
 
   const samples = decodeWav(wavBuffer);
   if (!samples || samples.length === 0) return null;
 
-  const eng = ensureEngine(paths, found.sherpa, threads);
+  const eng = ensureEngine(rt, rt.sherpa, threads);
   const segments = decodeWithTimestamps(eng, samples, { offset, language });
   if (segments.length === 0) {
     // 静音片：返回空数组而不是 null，让上层知道"确实跑了、确实没话"
@@ -305,5 +264,14 @@ export function transcribeLocal(wavBuffer, { offset = 0, language = 'auto', env 
 
 /** 本机到底能不能走本地转写（给 --plan 和能力提示用，不加载模型） */
 export function localAsrAvailable({ env = process.env } = {}) {
-  return Boolean(locateModel({ env })) && Boolean(locateSherpa({ env }));
+  return voiceInputRuntime({ env }).available;
+}
+
+/**
+ * 本地转写为什么不可用 —— 直接说人话，别让人去猜是模型坏了还是包没装。
+ * @returns {string|null} 可用时返回 null
+ */
+export function localAsrUnavailableReason({ env = process.env } = {}) {
+  const rt = voiceInputRuntime({ env });
+  return rt.available ? null : (rt.reason ?? '本地语音识别不可用');
 }

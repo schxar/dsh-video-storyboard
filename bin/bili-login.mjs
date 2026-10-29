@@ -23,10 +23,13 @@
  * （别的插件带进来的）；实在没有就退回"只给 URL"，自己去任意二维码工具生成。
  */
 
+import { existsSync } from 'node:fs';
 import { access, mkdir, readdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
+
+import { BILI_SCROLL_PKGS, biliCredentialSource } from '../src/deps.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
   + '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -380,6 +383,28 @@ async function checkLogin() {
 
 /* -------------------------------------------------------------------- main */
 
+/**
+ * 先看别的插件有没有留登录态。
+ *
+ * 装了 `dsh-bili-scroll` 的人必然已经登录过一次（那个插件不登录干不了活），
+ * 凭证就摆在那儿。这时候再让人掏手机扫一遍是纯粹浪费 —— 直接借来用。
+ *
+ * @returns {Promise<number|null>} 0 复用成功 / 1 有文件但失效 / null 没有可复用的
+ */
+async function tryReuseCredential() {
+  const src = biliCredentialSource();
+  if (!src) {
+    console.log(`· 没装 ${BILI_SCROLL_PKGS[0]}，没有可复用的登录态，走扫码`);
+    return null;
+  }
+  if (!existsSync(src.credential)) {
+    console.log('· 装了 bili-scroll 但它还没登录过，走扫码');
+    return null;
+  }
+  console.log(`· 发现 bili-scroll 留下的凭证：${src.credential}`);
+  return importCredential(src.credential);
+}
+
 const outPath = valueOf('--out')
   || join(DSH_HOME, 'bilibili-qrcode.png');
 
@@ -388,11 +413,16 @@ const fromFile = valueOf('--from');
 if (flag('--check')) {
   process.exitCode = await checkLogin();
 } else if (fromFile) {
-  // 别处已经登录过（比如 bili-subagent 写的 bili_credential.json）就直接借过来，
-  // 不为同一件事再扫一次码。
+  // 显式指定就从指定文件导
   process.exitCode = await importCredential(fromFile);
 } else {
-  // 二维码图片要先落到磁盘，所以确保父目录在
-  await mkdir(dirname(outPath), { recursive: true });
-  process.exitCode = await doLogin({ outPath });
+  // 没指定：先试现成凭证，实在没有才出二维码
+  const reused = await tryReuseCredential();
+  if (reused === 0) {
+    process.exitCode = 0;
+  } else {
+    // 二维码图片要先落到磁盘，所以确保父目录在
+    await mkdir(dirname(outPath), { recursive: true });
+    process.exitCode = await doLogin({ outPath });
+  }
 }

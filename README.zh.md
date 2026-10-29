@@ -69,6 +69,21 @@ yt-dlp 下高清和读官方字幕走的是同一份凭据，不用配两处。
 `~/.dsh/speech-to-text/sensevoice/models/`（239MB int8）+ `sherpa-onnx-node`（原生模块）。
 storyboard 探测到就直接用，探测不到就跳过，不会报错也不会让你先装点什么。
 
+### 依赖关系：这两块能力是"寄生"的
+
+| 能力 | 依赖谁 | 那个包不在时 |
+|---|---|---|
+| 本地语音识别 | `@deepseek-ai/dsh-experimental-speech-to-text-sensevoice` | 本地转写自动关闭，落回 HTTP ASR，再不行就只是没有台词 |
+| 免扫码登录 | `dsh-bili-scroll`（`dsh-bili-subagent`）留下的 `bili_credential.json` | 只能自己扫码，功能不缺 |
+
+两者都写进 `peerDependencies` 且标了 `optional`：**装了就用，没装不影响安装，也不会让分镜失败**。
+判定方式是"那个包在不在"，不是"某个路径下有没有文件"——所以换安装盘、改目录名都不会误判。
+宿主包的位置靠 `process.execPath` 反推（插件里跑时就是 DSH 自己的安装目录），
+特殊布局可以设 `DSH_DESKTOP_APP` 或 `DSH_EXTRA_MODULE_ROOTS` 覆盖。
+
+`bili-login.mjs` 因此**默认先找现成凭证**：装了 bili-scroll 的人早就登录过，
+没必要为同一件事再掏一次手机。真找不到才出二维码。
+
 实测本机：212 秒的片子，本地转写 **10.5 秒**（含模型加载），零 API key。
 SenseVoice **只吐文本不吐时间戳**，句子的起止是靠 silero VAD 的语音段位置算出来的 ——
 没有这一步，整段只能挂一个起点，台词会被贴到错误的格子上。
